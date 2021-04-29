@@ -71,7 +71,10 @@ class BinaryTreeSet extends Actor {
   // optional
   /** Accepts `Operation` and `GC` messages. */
   val normal: Receive = {
-    case operation:Operation => root ! operation
+
+    case operation:Operation =>
+      root ! operation
+
     // start gc and pass in a new root to contain the cleaned up tree
     case GC =>
       val newRoot = createRoot
@@ -85,7 +88,10 @@ class BinaryTreeSet extends Actor {
     * all non-removed elements into.
     */
   def garbageCollecting(newRoot: ActorRef): Receive = {
-    case operation:Operation => pendingQueue = pendingQueue.enqueue(operation)
+
+    case operation:Operation =>
+      pendingQueue = pendingQueue.enqueue(operation)
+
     case CopyFinished =>
       root ! PoisonPill  // Stop the old root
       root = newRoot
@@ -133,17 +139,13 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
 
     case Contains(requester: ActorRef, id: Int, elemSearch: Int) =>
 
-      if (elemSearch == elem ) {
-        println(s"ContainsResult(${id}, ${true && !removed})")
+      if (elemSearch == elem )
         requester ! ContainsResult(id, true && !removed)
-      }
       else {
         val pos: Position = if (elemSearch > elem) Right else Left
         subtrees.get(pos) match {
-          case None => {
-            println(s"ContainsResult(${id}, false)")
-            requester ! ContainsResult(id, false)
-          } // notify requester that elemSearch is not present
+          case None => requester ! ContainsResult(id, false)
+          // notify requester that elemSearch is not present
           case Some(node) => node ! Contains(requester,id,elemSearch) // delegate to appropriate child node
         }
       }
@@ -160,9 +162,8 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
         val pos: Position = if (elemNew > elem) Right else Left
         subtrees.get(pos) match {
           case None => { // there is still room available
-            val node = context.actorOf( props(elemNew,false) )
+            val node = context.actorOf( props(elemNew,false) ) // a child actor
             subtrees += (pos -> node) // add node at pos
-            println(s"OperationFinished(${id})")
             requester ! OperationFinished(id) // notify requester
           }
           case Some(node) => // there is already a node there, so forward message to that node
@@ -173,9 +174,8 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
 
     case Remove(requester: ActorRef, id: Int, elemRemove: Int) =>
 
-      if( elemRemove == elem ) {
+      if ( elemRemove == elem ) {
         removed = true
-        println(s"OperationFinished(${id}) (remove)")
         requester ! OperationFinished(id)
       }
       else {
@@ -196,7 +196,8 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
       * */
     case CopyTo(root: ActorRef) =>
 
-      if (removed && subtrees.isEmpty) sender ! CopyFinished
+      if (removed && subtrees.isEmpty)
+        sender ! CopyFinished
       else {
         // If not flagged as 'removed', copy node to the new tree
         if (!removed) root ! Insert(self, elem, elem) // make int value the id (elem)?
@@ -217,7 +218,6 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
     case OperationFinished(_) =>
       if (expected.isEmpty) {
         context.parent ! CopyFinished
-        println("Operation finished  ........................................")
         context.become(normal)
       }
       else context.become(copying(expected, true))
@@ -226,7 +226,6 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
       val expNext: Set[ActorRef] = expected - sender
       if (expNext.isEmpty && insertConfirmed) {
         context.parent ! CopyFinished
-        println("Copy finished ........................................")
         context.become(normal)
       }
       else context.become(copying(expNext, insertConfirmed))
