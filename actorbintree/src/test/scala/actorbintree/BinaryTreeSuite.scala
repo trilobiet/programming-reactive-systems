@@ -67,6 +67,8 @@ class BinaryTreeSuite extends TestKit(ActorSystem("BinaryTreeSuite")) with Impli
       Contains(requesterRef, id=70, 2)
     )
 
+    // ops.foreach(println)
+
     val expectedReplies = List(
       OperationFinished(id=10),
       OperationFinished(id=20),

@@ -3,11 +3,10 @@ package async
 import scala.concurrent.{Future, Promise}
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.util.{Failure, Success, Try}
-import scala.util.control.NonFatal
 
 /**
   * Acdhirr sez:
-  * These riddles scan be solved after reading
+  * These riddles can be solved after reading
   * "Programming Scala 4th edition", chapter 32
   */
 object Async extends AsyncInterface {
@@ -59,7 +58,7 @@ object Async extends AsyncInterface {
     yield (f1, f2)
 
     // translates to:
-    // makeAsyncComputation1().flatMap(x => makeAsyncComputation2().map(y=>(x,y)))
+    // makeAsyncComputation1().flatMap(f1 => makeAsyncComputation2().map(f2=>(f1,f2)))
   }
 
   /**
