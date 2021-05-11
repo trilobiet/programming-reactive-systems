@@ -29,6 +29,7 @@ class Replicator(val replica: ActorRef) extends Actor {
   var pending = Vector.empty[Snapshot]
 
   // acdhirr: a map of repeatedly sent snapshots messages awaiting acknowledgement
+  val RepeatDelay = 100.milliseconds
   var scheduledSnapshotMessages = Map.empty[String,Cancellable]
   // acdhirr: this is the primary (leader) Replica that must be informed
   // when replication is finished successfully.
@@ -56,7 +57,7 @@ class Replicator(val replica: ActorRef) extends Actor {
       // replica ! Snapshot(key, valueOption, id)
       // Repeatedly send message to replica until canceled
       val cancellable = context.system.scheduler.scheduleWithFixedDelay(
-          Duration.Zero, 100.milliseconds, replica, Snapshot(key, valueOption, id))
+          Duration.Zero, RepeatDelay, replica, Snapshot(key, valueOption, id))
       scheduledSnapshotMessages += key->cancellable // add to map
 
 

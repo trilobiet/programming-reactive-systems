@@ -1,8 +1,9 @@
 package kvstore
 
-import akka.actor.{ OneForOneStrategy, PoisonPill, Props, SupervisorStrategy, Terminated, ActorRef, Actor }
+import akka.actor.{Actor, ActorRef, OneForOneStrategy, PoisonPill, Props, Stash, SupervisorStrategy, Terminated}
 import kvstore.Arbiter._
-import akka.pattern.{ ask, pipe }
+import akka.pattern.{ask, pipe}
+
 import scala.concurrent.duration._
 import akka.util.Timeout
 
@@ -23,7 +24,7 @@ object Replica {
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
 
-class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
+class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with Stash {
   import Replica._
   import Replicator._
   import Persistence._
@@ -32,7 +33,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
-  
+
+  // the data: key-value pairs
   var kv = Map.empty[String, String]
   // a map from secondary replicas to replicators
   var secondaries = Map.empty[ActorRef, ActorRef]
@@ -43,6 +45,13 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   // acdhirr: send request to join
   override def preStart() = { arbiter !Join }
+  // acdhirr: handle PersistenceException
+  override val supervisorStrategy = OneForOneStrategy() {
+    case e: PersistenceException =>
+      println("hell, no: " + e.getMessage)
+      akka.actor.SupervisorStrategy.Stop
+  }
+
 
   // When your actor starts, it must send a Join message to the Arbiter and then choose
   // between primary or secondary behavior according to the reply of the Arbiter to the
@@ -75,6 +84,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id) // kv get returns Option
 
+    case Persisted(key,id) => ???
+
     /* When a new replica joins the system, the primary receives a new Replicas message
     and must allocate a new actor of type Replicator for the new replica;
     when a replica leaves the system its corresponding Replicator must be terminated. */
@@ -103,12 +114,36 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
     case Snapshot(key, valueOption, seq) if seq == nextSeq =>
       // Update and persist when expected seq number arrives
+      val persistence: ActorRef = context.actorOf(persistenceProps)
+      // map this transaction number to the replicator that must be acknowledged
+      context.watch(persistence)
       valueOption match {
         case None => kv -= key
         case Some(value) => kv += (key->value)
       }
-      nextSeq += 1
-      sender() ! SnapshotAck(key, seq)
+      val persistMsg: Persist = Persist(key,valueOption,seq)
+      persistence ! persistMsg
+
+      context.become( persisting(sender,persistMsg), discardOld = false ) // discard=false, so we can use 'unbecome'
+  }
+
+  def persisting(replicator: ActorRef, persistMsg: Persist): Receive = {
+
+    case Terminated(actor) => {  // message is sent when persistence Actor fails and stops
+      println(actor + " terminated, try again")
+      val persistence: ActorRef = context.actorOf(persistenceProps)
+      context.watch(persistence)
+      persistence ! persistMsg
+    }
+
+    case Persisted(key,id) =>
+      println("Acknowledged")
+      replicator ! SnapshotAck(key, id)
+      context.unbecome()  // revert to previous behaviour
+      unstashAll()
+
+    case _ => stash()
+
   }
 
 }
