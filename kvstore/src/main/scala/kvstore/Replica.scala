@@ -45,13 +45,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
   // acdhirr: send request to join
   override def preStart() = { arbiter !Join }
-  // acdhirr: handle PersistenceException
-  override val supervisorStrategy = OneForOneStrategy() {
-    case e: PersistenceException =>
-      println("hell, no: " + e.getMessage)
-      akka.actor.SupervisorStrategy.Stop
-  }
-
 
   // When your actor starts, it must send a Join message to the Arbiter and then choose
   // between primary or secondary behavior according to the reply of the Arbiter to the
@@ -113,32 +106,34 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       sender() ! SnapshotAck(key, seq)
 
     case Snapshot(key, valueOption, seq) if seq == nextSeq =>
-      // Update and persist when expected seq number arrives
-      val persistence: ActorRef = context.actorOf(persistenceProps)
-      // map this transaction number to the replicator that must be acknowledged
-      context.watch(persistence)
+
       valueOption match {
         case None => kv -= key
         case Some(value) => kv += (key->value)
       }
-      val persistMsg: Persist = Persist(key,valueOption,seq)
-      persistence ! persistMsg
 
+      val persistMsg: Persist = Persist(key,valueOption,seq)
       context.become( persisting(sender,persistMsg), discardOld = false ) // discard=false, so we can use 'unbecome'
+      self ! persistMsg
   }
 
   def persisting(replicator: ActorRef, persistMsg: Persist): Receive = {
 
-    case Terminated(actor) => {  // message is sent when persistence Actor fails and stops
-      println(actor + " terminated, try again")
+    // Secondary replica should already serve the received update while waiting for persistence!
+    case Get(key, id) =>
+      sender() ! GetResult(key, kv.get(key), id)
+
+    case persistMsg: Persist =>
       val persistence: ActorRef = context.actorOf(persistenceProps)
       context.watch(persistence)
-      persistence ! persistMsg
-    }
+      context.system.scheduler.scheduleWithFixedDelay(  // TODO stop schedule when Persisted arrives
+        Duration.Zero,100.milliseconds,persistence,persistMsg
+      )
 
+    // Persistence succeeded
     case Persisted(key,id) =>
-      println("Acknowledged")
       replicator ! SnapshotAck(key, id)
+      nextSeq += 1
       context.unbecome()  // revert to previous behaviour
       unstashAll()
 
