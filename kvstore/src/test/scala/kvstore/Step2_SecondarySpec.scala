@@ -4,6 +4,7 @@ import akka.testkit.TestProbe
 
 import scala.concurrent.duration._
 import kvstore.Arbiter.{Join, JoinedSecondary}
+import kvstore.Replica.Get
 import org.junit.Assert._
 import org.junit.Test
 
@@ -34,14 +35,20 @@ trait Step2_SecondarySpec { this: KVStoreSuite =>
     assertEquals(None, client.get("k1"))
 
     replicator.send(secondary, Snapshot("k1", None, 0L))
+    //replicator.send(secondary, Snapshot("k44", None, 120L))
+    //replicator.send(secondary, Get("k3", 200))
+
+    println("send 1")
     replicator.expectMsg(SnapshotAck("k1", 0L))
     assertEquals(None, client.get("k1"))
 
     replicator.send(secondary, Snapshot("k1", Some("v1"), 1L))
+    println("send 2")
     replicator.expectMsg(SnapshotAck("k1", 1L))
     assertEquals(Some("v1"), client.get("k1"))
 
     replicator.send(secondary, Snapshot("k1", None, 2L))
+    println("send 3")
     replicator.expectMsg(SnapshotAck("k1", 2L))
     assertEquals(None, client.get("k1"))
   }

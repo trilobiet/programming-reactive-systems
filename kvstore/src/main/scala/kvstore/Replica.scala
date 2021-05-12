@@ -1,5 +1,6 @@
 package kvstore
 
+import akka.actor.SupervisorStrategy.Stop
 import akka.actor.{Actor, ActorRef, OneForOneStrategy, PoisonPill, Props, Stash, SupervisorStrategy, Terminated}
 import kvstore.Arbiter._
 import akka.pattern.{ask, pipe}
@@ -15,6 +16,8 @@ object Replica {
   case class Insert(key: String, value: String, id: Long) extends Operation
   case class Remove(key: String, id: Long) extends Operation
   case class Get(key: String, id: Long) extends Operation
+
+  case class Current()
 
   sealed trait OperationReply
   case class OperationAck(id: Long) extends OperationReply
@@ -43,13 +46,16 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   // secondary nodes expect this seq number for updates
   var nextSeq = 0L
 
-  // acdhirr: send request to join
+  // acdhirr: after creation send request to join
   override def preStart() = { arbiter !Join }
+
   // acdhirr: handle PersistenceException
+  // Stop the persistence actor so we can catch its Terminated message
+  // and try again
   override val supervisorStrategy = OneForOneStrategy() {
     case e: PersistenceException =>
-      println("hell, no: " + e.getMessage)
-      akka.actor.SupervisorStrategy.Stop
+      println("Hell, no: " + e.getMessage)
+      Stop
   }
 
 
@@ -104,47 +110,67 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   val replica: Receive = {
 
     case Get(key, id) =>
+      println(s"GET ($key,$id)=${kv.get(key)}")
       sender() ! GetResult(key, kv.get(key), id) // kv get returns Option
 
-    // messages coming from the Replicator:
+    // *** messages coming from the Replicator ***
+
+    // Do not process messages with a sequence number smaller
+    // than the expected number, but do immediately acknowledge them
     case Snapshot(key, _, seq) if seq < nextSeq =>
-      // Do not process messages with a sequence number smaller
-      // than the expected number, but do immediately acknowledge them
       sender() ! SnapshotAck(key, seq)
 
+    // Update and persist when expected seq number arrives
     case Snapshot(key, valueOption, seq) if seq == nextSeq =>
-      // Update and persist when expected seq number arrives
-      val persistence: ActorRef = context.actorOf(persistenceProps)
-      // map this transaction number to the replicator that must be acknowledged
-      context.watch(persistence)
+
       valueOption match {
         case None => kv -= key
         case Some(value) => kv += (key->value)
       }
-      val persistMsg: Persist = Persist(key,valueOption,seq)
-      persistence ! persistMsg
 
+      /*
+      nextSeq += 1
+      sender ! SnapshotAck(key, seq)
+      */
+
+      val persistMsg: Persist = Persist(key,valueOption,seq)
       context.become( persisting(sender,persistMsg), discardOld = false ) // discard=false, so we can use 'unbecome'
+      self ! persistMsg
   }
 
   def persisting(replicator: ActorRef, persistMsg: Persist): Receive = {
 
-    case Terminated(actor) => {  // message is sent when persistence Actor fails and stops
+    // Secondary replica should already serve the received update while waiting for persistence!
+    case Get(key, id) =>
+      sender() ! GetResult(key, kv.get(key), id)
+
+    // When a persistence Actor fails with a PersistenceException
+    // and stops, Terminated msg is sent due to chosen supervisorStrategy (above)
+    case Terminated(actor) => {
       println(actor + " terminated, try again")
-      val persistence: ActorRef = context.actorOf(persistenceProps)
-      context.watch(persistence)
-      persistence ! persistMsg
+      context.system.scheduler.scheduleOnce(50.milliseconds) {
+        self ! persistMsg // Try again TODO: maybe limit number of retries
+      }
     }
 
+    case persistMsg: Persist =>
+      val persistence: ActorRef = context.actorOf(persistenceProps)
+      context.watch(persistence)
+      context.system.scheduler.scheduleWithFixedDelay(
+        Duration.Zero,100.milliseconds,persistence,persistMsg
+      )
+
+    // Persistence succeeded
     case Persisted(key,id) =>
-      println("Acknowledged")
       replicator ! SnapshotAck(key, id)
+      nextSeq += 1
       context.unbecome()  // revert to previous behaviour
       unstashAll()
 
     case _ => stash()
 
   }
+
 
 }
 

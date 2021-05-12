@@ -17,8 +17,9 @@ class Persistence(flaky: Boolean) extends Actor {
 
   def receive = {
     case Persist(key, _, id) =>
-      // if (!flaky || Random.nextBoolean()) sender ! Persisted(key, id) // TODO restore
-      if (false || Random.nextBoolean()) sender ! Persisted(key, id)
+      println(s"Persist $key,$id ")
+      if (!flaky || Random.nextBoolean()) sender ! Persisted(key, id)
+      // if (false || Random.nextBoolean()) sender ! Persisted(key, id) // force flaky
       else throw new PersistenceException
   }
 
