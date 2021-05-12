@@ -156,9 +156,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case persistMsg: Persist =>
       val persistence: ActorRef = context.actorOf(persistenceProps)
       context.watch(persistence)
-      context.system.scheduler.scheduleWithFixedDelay(
+      /*context.system.scheduler.scheduleWithFixedDelay(  // to satisfy 2nd test of Step4
         Duration.Zero,100.milliseconds,persistence,persistMsg
-      )
+      )*/
+      persistence ! persistMsg
 
     // Persistence succeeded
     case Persisted(key,id) =>
