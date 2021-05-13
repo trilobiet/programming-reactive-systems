@@ -1,6 +1,7 @@
 package kvstore
 
-import akka.actor.{Actor, ActorRef, OneForOneStrategy, PoisonPill, Props, Stash, SupervisorStrategy, Terminated}
+import akka.actor.SupervisorStrategy.Stop
+import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, PoisonPill, Props, Stash, SupervisorStrategy, Terminated}
 import kvstore.Arbiter._
 import akka.pattern.{ask, pipe}
 
@@ -15,6 +16,8 @@ object Replica {
   case class Insert(key: String, value: String, id: Long) extends Operation
   case class Remove(key: String, id: Long) extends Operation
   case class Get(key: String, id: Long) extends Operation
+
+  case class Current()
 
   sealed trait OperationReply
   case class OperationAck(id: Long) extends OperationReply
@@ -42,9 +45,17 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   var replicators = Set.empty[ActorRef]
   // secondary nodes expect this seq number for updates
   var nextSeq = 0L
+  var persistTask: Option[Cancellable] = None
 
-  // acdhirr: send request to join
+  // acdhirr: after creation send request to join
   override def preStart() = { arbiter !Join }
+
+  // Stop the persistence actor on error
+  override val supervisorStrategy = OneForOneStrategy() {
+    case e: PersistenceException =>
+      println("Hell, no: " + e.getMessage)
+      Stop
+  }
 
   // When your actor starts, it must send a Join message to the Arbiter and then choose
   // between primary or secondary behavior according to the reply of the Arbiter to the
@@ -97,20 +108,28 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   val replica: Receive = {
 
     case Get(key, id) =>
+      println(s"GET ($key,$id)=${kv.get(key)}")
       sender() ! GetResult(key, kv.get(key), id) // kv get returns Option
 
-    // messages coming from the Replicator:
+    // *** messages coming from the Replicator ***
+
+    // Do not process messages with a sequence number smaller
+    // than the expected number, but do immediately acknowledge them
     case Snapshot(key, _, seq) if seq < nextSeq =>
-      // Do not process messages with a sequence number smaller
-      // than the expected number, but do immediately acknowledge them
       sender() ! SnapshotAck(key, seq)
 
+    // Update and persist when expected seq number arrives
     case Snapshot(key, valueOption, seq) if seq == nextSeq =>
 
       valueOption match {
         case None => kv -= key
         case Some(value) => kv += (key->value)
       }
+
+      /*
+      nextSeq += 1
+      sender ! SnapshotAck(key, seq)
+      */
 
       val persistMsg: Persist = Persist(key,valueOption,seq)
       context.become( persisting(sender,persistMsg), discardOld = false ) // discard=false, so we can use 'unbecome'
@@ -125,21 +144,24 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
     case persistMsg: Persist =>
       val persistence: ActorRef = context.actorOf(persistenceProps)
-      context.watch(persistence)
-      context.system.scheduler.scheduleWithFixedDelay(  // TODO stop schedule when Persisted arrives
+      //context.watch(persistence)
+      persistTask = Some(context.system.scheduler.scheduleWithFixedDelay(  // to satisfy 2nd test of Step4, switch off when persisted arrives
         Duration.Zero,100.milliseconds,persistence,persistMsg
-      )
+      ))
 
     // Persistence succeeded
     case Persisted(key,id) =>
       replicator ! SnapshotAck(key, id)
-      nextSeq += 1
+      nextSeq += 1 // increase counter
+      sender ! Stop
+      persistTask.map(_.cancel()) // stop repeating messages
       context.unbecome()  // revert to previous behaviour
       unstashAll()
 
     case _ => stash()
 
   }
+
 
 }
 
