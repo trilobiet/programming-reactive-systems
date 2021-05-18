@@ -70,7 +70,7 @@ class Replicator(val replica: ActorRef) extends Actor {
     // incremented by one
     case SnapshotAck(key, seq) =>
       primary.map(_ ! Replicated(key, seq))  // primary is Option
-      scheduledSnapshotMessages(key).cancel() // cancel this schedule
+      scheduledSnapshotMessages(key).cancel() // cancel this scheduled message
       scheduledSnapshotMessages -= key
 
   }

@@ -1,12 +1,14 @@
 package kvstore
 
 import akka.actor.SupervisorStrategy.Stop
-import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, PoisonPill, Props, Stash, SupervisorStrategy, Terminated}
+import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, PoisonPill, Props, ReceiveTimeout, Stash, SupervisorStrategy, Terminated}
+import akka.event.LoggingReceive
 import kvstore.Arbiter._
 import akka.pattern.{ask, pipe}
 
 import scala.concurrent.duration._
 import akka.util.Timeout
+import kvstore.Disseminator.{AllReplicated, DisseminationTimeout}
 
 object Replica {
   sealed trait Operation {
@@ -17,7 +19,7 @@ object Replica {
   case class Remove(key: String, id: Long) extends Operation
   case class Get(key: String, id: Long) extends Operation
 
-  case class Current()
+  case class IsPersisted(key: String, id: Long)
 
   sealed trait OperationReply
   case class OperationAck(id: Long) extends OperationReply
@@ -47,8 +49,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   var nextSeq = 0L
   var persistTask: Option[Cancellable] = None
 
+  // who made which request
+  var clients = Map.empty[Long,ActorRef]
+  var complete = scala.collection.mutable.Map.empty[Long,Int]
+
   // acdhirr: after creation send request to join
   override def preStart() = { arbiter !Join }
+
+  context.setReceiveTimeout(1000.milliseconds)
 
   // Stop the persistence actor on error
   override val supervisorStrategy = OneForOneStrategy() {
@@ -77,26 +85,89 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   // More details can be found in the section “Replication Protocol”.
   val leader: Receive = {
 
+    case DisseminationTimeout(id) =>
+      println(s"waaaaaaaaaaaaaaaaaay too long ${id}")
+      clients(id) ! OperationFailed(id)
+
+    case IsPersisted(key,id) =>
+      println("primary is persisted")
+      complete(id) += 1
+      if (complete(id) == 2) clients(id) ! OperationAck(id)
+
     case Insert(key, value, id) =>
       kv += (key->value)
-      // TODO persist, then send ack when persistence succeeds
-      sender() ! OperationAck(id)
+      clients += id->sender()
+      complete += id->0
+
+      // Persist and replicate
+      val persistMsg: Persist = Persist(key,Some(value),id)
+      context.become( persisting(persistMsg), discardOld = false ) // discard=false, so we can use 'unbecome'
+      self ! persistMsg
+      // sender() ! OperationAck(id)
+
+      println("bbbb")
+      val disseminator: ActorRef = context.actorOf(Props(new Disseminator(Replicate(key,Some(value),id),secondaries.values.toSet)))
+
     case Remove(key, id) =>
       kv -= key
-      // TODO persist, then send ack when persistence succeeds
-      sender() ! OperationAck(id)
+      clients += id->sender()
+      complete += id->0
+
+      // Persist and replicate, then send ack when these succeed
+      val persistMsg: Persist = Persist(key,None,id)
+      context.become( persisting(persistMsg), discardOld = false ) // discard=false, so we can use 'unbecome'
+      self ! persistMsg
+      // sender() ! OperationAck(id)
+
+      val disseminator: ActorRef = context.actorOf(Props(new Disseminator(Replicate(key,None,id),secondaries.values.toSet)))
+
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id) // kv get returns Option
 
-    case Persisted(key,id) => ???
+    case AllReplicated(id) =>
+      println(id + " replicated")
+      complete(id) += 1
+      if (complete(id) == 2) clients(id) ! OperationAck(id)
+
 
     /* When a new replica joins the system, the primary receives a new Replicas message
-    and must allocate a new actor of type Replicator for the new replica;
-    when a replica leaves the system its corresponding Replicator must be terminated. */
+    and must allocate a new actor of type Replicator for the new replica; when a replica
+    leaves the system its corresponding Replicator must be terminated.
+    The role of this Replicator actor is to accept update events, and propagate the changes
+    to its corresponding replica (i.e. there is exactly one Replicator per secondary replica).
+    Also, notice that at creation time of the Replicator, the primary must forward update
+    events for every key-value pair it currently holds to this Replicator.
+    */
     case Replicas(replicas) =>
-      // TODO
-      println("Replicas: " + replicas)
+
+      // remove removed replicas from secondaries
+      secondaries.foreach(sec => {
+        val secondary = sec._1
+        if (!replicas.contains(secondary)) {
+          val replicator = secondaries(secondary)
+          //replicator ! Stop
+          secondaries -= secondary
+          //secondary ! Stop
+        }
+      })
+
+      // Add new secondaries
+      replicas.filter(r => r.actorRef != self.actorRef).foreach( replica =>
+        if (!secondaries.contains(replica)) {
+          // allocate a new actor of type Replicator for the new replica
+          val replicator = context.actorOf(Props(new Replicator(replica)))
+          secondaries += replica->replicator
+          // send all historic messages to new replica
+          kv.foreach(kv => {
+
+            // println("replicator ! " + Replicate(kv._1, Some(kv._2), nextSeq))
+            replicator ! Replicate(kv._1, Some(kv._2), nextSeq)
+            nextSeq += 1
+          })
+        }
+      )
   }
+
 
 
   /* TODO Behavior for the replica (SECONDARY) role. */
@@ -111,8 +182,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       println(s"GET ($key,$id)=${kv.get(key)}")
       sender() ! GetResult(key, kv.get(key), id) // kv get returns Option
 
-    // *** messages coming from the Replicator ***
-
     // Do not process messages with a sequence number smaller
     // than the expected number, but do immediately acknowledge them
     case Snapshot(key, _, seq) if seq < nextSeq =>
@@ -121,22 +190,22 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     // Update and persist when expected seq number arrives
     case Snapshot(key, valueOption, seq) if seq == nextSeq =>
 
+      secondaries += self->sender // map replicator to this replica
+
       valueOption match {
         case None => kv -= key
         case Some(value) => kv += (key->value)
       }
 
-      /*
-      nextSeq += 1
-      sender ! SnapshotAck(key, seq)
-      */
-
       val persistMsg: Persist = Persist(key,valueOption,seq)
-      context.become( persisting(sender,persistMsg), discardOld = false ) // discard=false, so we can use 'unbecome'
+      context.become( persisting(persistMsg), discardOld = false ) // discard=false, so we can use 'unbecome'
       self ! persistMsg
+
+    case IsPersisted(key,id) =>
+      secondaries(self) ! SnapshotAck(key, id) // forward to replicator
   }
 
-  def persisting(replicator: ActorRef, persistMsg: Persist): Receive = {
+  def persisting(persistMsg: Persist): Receive = {
 
     // Secondary replica should already serve the received update while waiting for persistence!
     case Get(key, id) =>
@@ -144,14 +213,19 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
     case persistMsg: Persist =>
       val persistence: ActorRef = context.actorOf(persistenceProps)
-      //context.watch(persistence)
+      // context.watch(persistence)
       persistTask = Some(context.system.scheduler.scheduleWithFixedDelay(  // to satisfy 2nd test of Step4, switch off when persisted arrives
         Duration.Zero,100.milliseconds,persistence,persistMsg
       ))
 
+    // Persistence time out
+    case ReceiveTimeout =>
+      println("timeout!!!!!!")
+      clients(persistMsg.id) ! OperationFailed(persistMsg.id)
+
     // Persistence succeeded
     case Persisted(key,id) =>
-      replicator ! SnapshotAck(key, id)
+      self ! IsPersisted(key, id) // forward to replicator
       nextSeq += 1 // increase counter
       sender ! Stop
       persistTask.map(_.cancel()) // stop repeating messages
@@ -161,7 +235,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case _ => stash()
 
   }
-
 
 }
 
