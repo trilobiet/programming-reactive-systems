@@ -1,12 +1,13 @@
 package kvstore
 
 import akka.actor.SupervisorStrategy.Stop
-import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, PoisonPill, Props, Stash, SupervisorStrategy, Terminated}
+import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, PoisonPill, Props, ReceiveTimeout, Stash, SupervisorStrategy, Terminated}
 import kvstore.Arbiter._
 import akka.pattern.{ask, pipe}
 
 import scala.concurrent.duration._
 import akka.util.Timeout
+import kvstore.RequestStatus.{AllReplicated, SecondaryConfirmed}
 
 object Replica {
   sealed trait Operation {
@@ -17,7 +18,7 @@ object Replica {
   case class Remove(key: String, id: Long) extends Operation
   case class Get(key: String, id: Long) extends Operation
 
-  case class Current()
+  case class IsPersisted(key: String, id: Long) extends Operation
 
   sealed trait OperationReply
   case class OperationAck(id: Long) extends OperationReply
@@ -47,6 +48,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   var nextSeq = 0L
   var persistTask: Option[Cancellable] = None
 
+  // who made which request
+  var requesters = Map.empty[Long,ActorRef]
+  var statusMap = Map.empty[Long,ActorRef]
+
   // acdhirr: after creation send request to join
   override def preStart() = { arbiter !Join }
 
@@ -56,6 +61,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       println("Hell, no: " + e.getMessage)
       Stop
   }
+
+  context.setReceiveTimeout(1000.milliseconds)
 
   // When your actor starts, it must send a Join message to the Arbiter and then choose
   // between primary or secondary behavior according to the reply of the Arbiter to the
@@ -77,25 +84,85 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   // More details can be found in the section “Replication Protocol”.
   val leader: Receive = {
 
-    case Insert(key, value, id) =>
-      kv += (key->value)
-      // TODO persist, then send ack when persistence succeeds
-      sender() ! OperationAck(id)
-    case Remove(key, id) =>
-      kv -= key
-      // TODO persist, then send ack when persistence succeeds
-      sender() ! OperationAck(id)
+    case IsPersisted(key, id) =>
+      println("buuuuurp")
+      statusMap(id) ! Persisted
+      context.become(replicating(id))
+      //TODO: send replication msg!
+
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id) // kv get returns Option
 
-    case Persisted(key,id) => ???
+    case Insert(key, value, id) =>
+      kv += (key->value)
+
+      requesters += id->sender
+
+      println(key,value,id)
+
+      val status = context.actorOf(Props(new RequestStatus(id,secondaries.values.toSet)))
+      statusMap += id->status
+
+      val persistMsg: Persist = Persist(key,Some(value),id)
+      context.become( persisting(persistMsg,isPrimary=true), discardOld = false ) // discard=false, so we can use 'unbecome'
+      self ! persistMsg
+
+      // send to all replicators
+      println("SECONDARIES: " + secondaries.values)
+      secondaries.values.foreach(_ ! Replicate(key, Some(value), id) )
+
+    case Remove(key, id) =>
+      kv -= key
+
+      requesters += id->sender
+
+      val status = context.actorOf(Props(new RequestStatus(id,secondaries.values.toSet)))
+      statusMap += id->status
+
+      val persistMsg: Persist = Persist(key,None,id)
+      context.become( persisting(persistMsg,isPrimary=true), discardOld = false ) // discard=false, so we can use 'unbecome'
+      self ! persistMsg
+
+      // send to all replicators
+      secondaries.values.foreach(_ ! Replicate(key, None, id) )
+
 
     /* When a new replica joins the system, the primary receives a new Replicas message
-    and must allocate a new actor of type Replicator for the new replica;
-    when a replica leaves the system its corresponding Replicator must be terminated. */
+    and must allocate a new actor of type Replicator for the new replica; when a replica
+    leaves the system its corresponding Replicator must be terminated.
+    The role of this Replicator actor is to accept update events, and propagate the changes
+    to its corresponding replica (i.e. there is exactly one Replicator per secondary replica).
+    Also, notice that at creation time of the Replicator, the primary must forward update
+    events for every key-value pair it currently holds to this Replicator.
+    */
     case Replicas(replicas) =>
-      // TODO
-      println("Replicas: " + replicas)
+
+      // remove removed replicas from secondaries
+      secondaries.foreach(sec => {
+        val secondary = sec._1
+        if (!replicas.contains(secondary)) {
+          val replicator = secondaries(secondary)
+          //replicator ! Stop
+          secondaries -= secondary
+          //secondary ! Stop
+        }
+      })
+
+      // Add new secondaries
+      replicas.filter(r => r.actorRef != self.actorRef).foreach( replica =>
+        if (!secondaries.contains(replica)) {
+          // allocate a new actor of type Replicator for the new replica
+          val replicator = context.actorOf(Props(new Replicator(replica)))
+          secondaries += replica->replicator
+          // send all historic messages to new replica
+          kv.foreach(kv => {
+
+            // println("replicator ! " + Replicate(kv._1, Some(kv._2), nextSeq))
+            replicator ! Replicate(kv._1, Some(kv._2), nextSeq)
+            nextSeq += 1
+          })
+        }
+      )
   }
 
 
@@ -120,7 +187,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
     // Update and persist when expected seq number arrives
     case Snapshot(key, valueOption, seq) if seq == nextSeq =>
-
       valueOption match {
         case None => kv -= key
         case Some(value) => kv += (key->value)
@@ -131,12 +197,19 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       sender ! SnapshotAck(key, seq)
       */
 
+      requesters += seq->sender
+
       val persistMsg: Persist = Persist(key,valueOption,seq)
-      context.become( persisting(sender,persistMsg), discardOld = false ) // discard=false, so we can use 'unbecome'
+      context.become( persisting( persistMsg, isPrimary=false), discardOld = false ) // discard=false, so we can use 'unbecome'
       self ! persistMsg
+
   }
 
-  def persisting(replicator: ActorRef, persistMsg: Persist): Receive = {
+  /* In case of the primary, the requester is a client which sent an Insert or Remove request
+  and the confirmation is an OperationAck, whereas in the case of a secondary the requester
+  is a Replicator sending a Snapshot and expecting a SnapshotAck back.
+  */
+  def persisting(persistMsg: Persist, isPrimary: Boolean): Receive = {
 
     // Secondary replica should already serve the received update while waiting for persistence!
     case Get(key, id) =>
@@ -149,9 +222,15 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
         Duration.Zero,100.milliseconds,persistence,persistMsg
       ))
 
+    case ReceiveTimeout =>
+      println("timeout!!!!!!")
+      requesters(persistMsg.id) ! OperationFailed(persistMsg.id)
+
     // Persistence succeeded
     case Persisted(key,id) =>
-      replicator ! SnapshotAck(key, id)
+      // if (isPrimary) requester ! OperationAck(id) // TODO for primary: only send Ack AFTER Replication succeeds
+      if (isPrimary) self ! IsPersisted(key, id) // TODO for primary: only send Ack AFTER Replication succeeds
+      else requesters(id) ! SnapshotAck(key, id)
       nextSeq += 1 // increase counter
       sender ! Stop
       persistTask.map(_.cancel()) // stop repeating messages
@@ -162,6 +241,25 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
   }
 
+
+  def replicating(id:Long): Receive = {
+
+    case ReceiveTimeout =>
+      println("timeout replicating!!!!!!")
+      requesters(id) ! OperationFailed(id)
+
+    case Replicated(key,id) =>
+      println("secondary replicated")
+      statusMap(id) ! SecondaryConfirmed(sender)
+
+    case AllReplicated(id) =>
+      println("ALL replicated")
+      requesters(id) ! OperationAck(id)
+      unstashAll()
+
+    case _ => stash()
+
+  }
 
 }
 

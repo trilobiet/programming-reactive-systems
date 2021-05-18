@@ -53,6 +53,9 @@ class Replicator(val replica: ActorRef) extends Actor {
     // be Some(value) while in case of a Remove operation it will be None. The sender of the
     // Replicate message shall be the Replica itself.
     case Replicate(key, valueOption, id) =>
+
+      println(s"Plz replicate $key $valueOption to $replica")
+
       primary = Some(sender)
       // replica ! Snapshot(key, valueOption, id)
       // Repeatedly send message to replica until canceled
