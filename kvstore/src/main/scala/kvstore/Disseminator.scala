@@ -8,33 +8,44 @@ import scala.concurrent.duration.DurationInt
 
 object Disseminator {
 
+  case class Disseminate()
   case class AllReplicated(id:Long)
   case class DisseminationTimeout(id:Long)
 }
 
-class Disseminator( replicateMsg:Replicate, secondaries: Set[ActorRef]) extends Actor {
+class Disseminator(replicateMsg:Replicate, replicators: Set[ActorRef]) extends Actor {
 
   import Disseminator._
 
   context.setReceiveTimeout(1000.milliseconds)
 
-  if (secondaries.isEmpty) context.parent ! AllReplicated(replicateMsg.id)
-  else secondaries.foreach( s => {
-    println(s"replicating to ${s}")
-    s ! replicateMsg
-  })
-
-  var refs = scala.collection.mutable.Set[ActorRef]()
-  secondaries.foreach(s => refs += s)
+  var reps = scala.collection.mutable.Set[ActorRef]()
+  replicators.foreach(r => reps += r)
 
   def receive = {
 
+    case Disseminate =>
+      if (replicators.isEmpty) {
+        //println(s"Nothing to disseminate ${replicateMsg.id}")
+        context.parent ! AllReplicated(replicateMsg.id)
+      }
+      else replicators.foreach(s => {
+        //println(s"replicating ${replicateMsg} to Replicator ${s} ")
+        s ! replicateMsg
+      })
+
     case Replicated(key, id) =>
-      println(s"Secondary ${id} confirmed")
-      refs -= sender
-      if (refs.isEmpty) context.parent ! AllReplicated(id)
+      //println(s"Secondary ${id} confirmed")
+      reps -= sender
+      if (reps.isEmpty) {
+        context.parent ! AllReplicated(id)
+        //println("ALL DONE FOR THIS DISSEMINATOR")
+        context.stop(self)
+      }
 
     case ReceiveTimeout =>
+      //println(self + ": we have a situation here " + context.parent)
       context.parent ! DisseminationTimeout(replicateMsg.id)
+      context.stop(self)
   }
 }

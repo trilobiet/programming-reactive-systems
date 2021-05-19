@@ -1,6 +1,6 @@
 package kvstore
 
-import akka.actor.{Actor, ActorRef, Cancellable, Props}
+import akka.actor.{Actor, ActorRef, Cancellable, Props, Terminated}
 
 import scala.concurrent.duration._
 
@@ -23,24 +23,17 @@ class Replicator(val replica: ActorRef) extends Actor {
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
 
+  context.watch(replica)
+
   // map from sequence number to pair of sender and request
   var acks = Map.empty[Long, (ActorRef, Replicate)]
   // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
   var pending = Vector.empty[Snapshot]
 
-  // acdhirr: a map of repeatedly sent snapshots messages awaiting acknowledgement
-  val RepeatDelay = 100.milliseconds
   var scheduledSnapshotMessages = Map.empty[String,Cancellable]
   // acdhirr: this is the primary (leader) Replica that must be informed
   // when replication is finished successfully.
   var primary:Option[ActorRef] = None
-  
-  var _seqCounter = 0L
-  def nextSeq() = {
-    val ret = _seqCounter
-    _seqCounter += 1
-    ret
-  }
 
   
   /* TODO Behavior for the Replicator. */
@@ -54,10 +47,10 @@ class Replicator(val replica: ActorRef) extends Actor {
     // Replicate message shall be the Replica itself.
     case Replicate(key, valueOption, id) =>
       primary = Some(sender)
-      // replica ! Snapshot(key, valueOption, id)
+      // println(s"Replica in replicator ${self} is ${replica}")
       // Repeatedly send message to replica until canceled
       val cancellable = context.system.scheduler.scheduleWithFixedDelay(
-          Duration.Zero, RepeatDelay, replica, Snapshot(key, valueOption, id))
+          Duration.Zero, 100.milliseconds, replica, Snapshot(key, valueOption, id))
       scheduledSnapshotMessages += key->cancellable // add to map
 
 
@@ -69,10 +62,16 @@ class Replicator(val replica: ActorRef) extends Actor {
     // the greater of the previously expected number and the sequence number just acknowledged,
     // incremented by one
     case SnapshotAck(key, seq) =>
+      // println("SnapshotAck from " + sender)
       primary.map(_ ! Replicated(key, seq))  // primary is Option
       scheduledSnapshotMessages(key).cancel() // cancel this scheduled message
       scheduledSnapshotMessages -= key
 
+  }
+
+  override def postStop(): Unit = {
+    println("REPLICATOR STOPPING " + self)
+    context.stop(replica)
   }
 
 }

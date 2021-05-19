@@ -8,7 +8,10 @@ import akka.pattern.{ask, pipe}
 
 import scala.concurrent.duration._
 import akka.util.Timeout
-import kvstore.Disseminator.{AllReplicated, DisseminationTimeout}
+import kvstore.Disseminator.{AllReplicated, Disseminate, DisseminationTimeout}
+
+import scala.collection.MapView
+import scala.util.Random
 
 object Replica {
   sealed trait Operation {
@@ -27,6 +30,8 @@ object Replica {
   case class GetResult(key: String, valueOption: Option[String], id: Long) extends OperationReply
 
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
+
+  def rnd: Integer = Random.between(100, 999)
 }
 
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with Stash {
@@ -60,9 +65,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
   // Stop the persistence actor on error
   override val supervisorStrategy = OneForOneStrategy() {
-    case e: PersistenceException =>
-      println("Hell, no: " + e.getMessage)
-      Stop
+    case e: PersistenceException => Stop
   }
 
   // When your actor starts, it must send a Join message to the Arbiter and then choose
@@ -86,27 +89,31 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   val leader: Receive = {
 
     case DisseminationTimeout(id) =>
-      println(s"waaaaaaaaaaaaaaaaaay too long ${id}")
+      //println(s"waaaaaaaaaaaaaaaaaay too long ${id}")
       clients(id) ! OperationFailed(id)
 
     case IsPersisted(key,id) =>
-      println("primary is persisted")
+      //println("primary is persisted")
       complete(id) += 1
-      if (complete(id) == 2) clients(id) ! OperationAck(id)
+      if (complete(id) == 2) {
+        clients(id) ! OperationAck(id)
+        //println("leader NEXTSEQ + 1")
+        nextSeq += 1 // increase counter
+      }
 
     case Insert(key, value, id) =>
       kv += (key->value)
       clients += id->sender()
       complete += id->0
 
-      // Persist and replicate
+      // Persist and replicate, then send ack when these succeed
+      //println("disseminate: insert")
+      val disseminator: ActorRef = context.actorOf(Props(new Disseminator(Replicate(key,Some(value),id),secondaries.values.toSet)),s"disseminator-${rnd}")
+      disseminator ! Disseminate
+
       val persistMsg: Persist = Persist(key,Some(value),id)
       context.become( persisting(persistMsg), discardOld = false ) // discard=false, so we can use 'unbecome'
       self ! persistMsg
-      // sender() ! OperationAck(id)
-
-      println("bbbb")
-      val disseminator: ActorRef = context.actorOf(Props(new Disseminator(Replicate(key,Some(value),id),secondaries.values.toSet)))
 
     case Remove(key, id) =>
       kv -= key
@@ -114,20 +121,25 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       complete += id->0
 
       // Persist and replicate, then send ack when these succeed
+      //println("disseminate: remove")
+      val disseminator: ActorRef = context.actorOf(Props(new Disseminator(Replicate(key,None,id),secondaries.values.toSet)),s"disseminator-${rnd}")
+      disseminator ! Disseminate
+
       val persistMsg: Persist = Persist(key,None,id)
       context.become( persisting(persistMsg), discardOld = false ) // discard=false, so we can use 'unbecome'
       self ! persistMsg
-      // sender() ! OperationAck(id)
-
-      val disseminator: ActorRef = context.actorOf(Props(new Disseminator(Replicate(key,None,id),secondaries.values.toSet)))
 
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id) // kv get returns Option
 
     case AllReplicated(id) =>
-      println(id + " replicated")
+      //println(id + " replicated")
       complete(id) += 1
-      if (complete(id) == 2) clients(id) ! OperationAck(id)
+      //println(id + " complete? " + complete(id))
+      if (complete(id) == 2) {
+        //println(s"Sending OperationAck(${id}) to ${clients(id)}")
+        clients(id) ! OperationAck(id)
+      }
 
 
     /* When a new replica joins the system, the primary receives a new Replicas message
@@ -140,32 +152,30 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     */
     case Replicas(replicas) =>
 
-      // remove removed replicas from secondaries
-      secondaries.foreach(sec => {
-        val secondary = sec._1
-        if (!replicas.contains(secondary)) {
-          val replicator = secondaries(secondary)
-          //replicator ! Stop
-          secondaries -= secondary
-          //secondary ! Stop
-        }
-      })
+      val secReplicas = replicas.filterNot(_.actorRef==self)
+      val newReplicas: Set[ActorRef] = secReplicas.diff(secondaries.keys.toSet)
+      val removedReplicas: Set[ActorRef] = secondaries.keys.toSet.diff(secReplicas)
 
-      // Add new secondaries
-      replicas.filter(r => r.actorRef != self.actorRef).foreach( replica =>
-        if (!secondaries.contains(replica)) {
-          // allocate a new actor of type Replicator for the new replica
-          val replicator = context.actorOf(Props(new Replicator(replica)))
-          secondaries += replica->replicator
-          // send all historic messages to new replica
-          kv.foreach(kv => {
+      // remove and stop removed replicas
+      removedReplicas.foreach(r => {
+          context.stop(r)
+          println("-- Stopped " + r)
+          secondaries -= r
+        })
 
-            // println("replicator ! " + Replicate(kv._1, Some(kv._2), nextSeq))
-            replicator ! Replicate(kv._1, Some(kv._2), nextSeq)
-            nextSeq += 1
-          })
-        }
-      )
+      // Add new replicas
+      newReplicas.foreach( r => secondaries += r -> context.actorOf(Props(new Replicator(r)),s"replicator-${rnd}"))
+      val newSecondaries: Map[ActorRef, ActorRef] = secondaries.view.filterKeys(newReplicas).toMap
+      //println("!!! New secondaries: " + newSecondaries)
+
+      kv.zipWithIndex.foreach { case((k,v),i) => {
+        //println("Start replicating " + (k,v))
+        complete(i) = 1  // already persisted!
+        clients += i.toLong->self
+        val disseminator: ActorRef = context.actorOf(Props(new Disseminator(Replicate(k, Some(v), i), newSecondaries.values.toSet)),s"disseminator-${rnd}")
+        //println("disseminating from " + disseminator)
+        disseminator ! Disseminate
+      }}
   }
 
 
@@ -179,7 +189,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   val replica: Receive = {
 
     case Get(key, id) =>
-      println(s"GET ($key,$id)=${kv.get(key)}")
+      //println(s"GET ($key,$id)=${kv.get(key)}")
       sender() ! GetResult(key, kv.get(key), id) // kv get returns Option
 
     // Do not process messages with a sequence number smaller
@@ -203,6 +213,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
     case IsPersisted(key,id) =>
       secondaries(self) ! SnapshotAck(key, id) // forward to replicator
+      //println("secondary NEXTSEQ + 1")
+      nextSeq += 1 // increase counter
+
   }
 
   def persisting(persistMsg: Persist): Receive = {
@@ -212,7 +225,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       sender() ! GetResult(key, kv.get(key), id)
 
     case persistMsg: Persist =>
-      val persistence: ActorRef = context.actorOf(persistenceProps)
+      val persistence: ActorRef = context.actorOf(persistenceProps,s"persistence-${rnd}")
       // context.watch(persistence)
       persistTask = Some(context.system.scheduler.scheduleWithFixedDelay(  // to satisfy 2nd test of Step4, switch off when persisted arrives
         Duration.Zero,100.milliseconds,persistence,persistMsg
@@ -220,14 +233,13 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
     // Persistence time out
     case ReceiveTimeout =>
-      println("timeout!!!!!!")
+      //println("timeout!!!!!!")
       clients(persistMsg.id) ! OperationFailed(persistMsg.id)
 
     // Persistence succeeded
     case Persisted(key,id) =>
       self ! IsPersisted(key, id) // forward to replicator
-      nextSeq += 1 // increase counter
-      sender ! Stop
+      context.stop(sender)
       persistTask.map(_.cancel()) // stop repeating messages
       context.unbecome()  // revert to previous behaviour
       unstashAll()
@@ -235,6 +247,11 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case _ => stash()
 
   }
+
+  override def postStop(): Unit = {
+    println("REPLICA STOPPING " + self)
+  }
+
 
 }
 

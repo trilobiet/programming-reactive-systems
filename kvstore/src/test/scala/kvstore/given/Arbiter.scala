@@ -12,6 +12,8 @@ class Arbiter(lossy: Boolean, audit: ActorRef) extends Actor {
   var leader: Option[ActorRef] = None
   var replicas = Set.empty[ActorRef]
 
+  def rnd: Integer = Random.between(100, 999)
+
   def receive = {
     case Join =>
       if (leader.isEmpty) {
@@ -20,7 +22,7 @@ class Arbiter(lossy: Boolean, audit: ActorRef) extends Actor {
         sender ! JoinedPrimary
         audit ! JoinedPrimary
       } else {
-        replicas += (if (lossy) context.actorOf(Props(classOf[LossyTransport], sender)) else sender)
+        replicas += (if (lossy) context.actorOf(Props(classOf[LossyTransport], sender),s"replica-${rnd}") else sender)
         sender ! JoinedSecondary
         audit ! JoinedSecondary
       }
