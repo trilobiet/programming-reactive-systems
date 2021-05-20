@@ -35,6 +35,12 @@ class Replicator(val replica: ActorRef) extends Actor {
   // when replication is finished successfully.
   var primary:Option[ActorRef] = None
 
+  private var seqCounter = -1L
+  def nextSeq() = {
+    seqCounter += 1
+    seqCounter
+  }
+
   
   /* TODO Behavior for the Replicator. */
   // The role of this Replicator actor is to accept update events, and propagate the changes
@@ -50,7 +56,7 @@ class Replicator(val replica: ActorRef) extends Actor {
       // println(s"Replica in replicator ${self} is ${replica}")
       // Repeatedly send message to replica until canceled
       val cancellable = context.system.scheduler.scheduleWithFixedDelay(
-          Duration.Zero, 100.milliseconds, replica, Snapshot(key, valueOption, id))
+          Duration.Zero, 100.milliseconds, replica, Snapshot(key, valueOption, nextSeq()))
       scheduledSnapshotMessages += key->cancellable // add to map
 
 
