@@ -49,7 +49,10 @@ class Disseminator(replicateMsg:Replicate, replicators: Set[ActorRef]) extends A
 
   // Send Replicate message to all known Replicators
   def replicate() =
-    reps.foreach(s => s ! replicateMsg)
+    reps.foreach(s => {
+      //  println(s"replicating ${replicateMsg} to Replicator ${s} ")
+      s ! replicateMsg
+    })
 
 
 }

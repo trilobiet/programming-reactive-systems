@@ -73,14 +73,17 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   }
   // -------------------------------------------------------------
 
-  // acdhirr: after creation send request to join
-  override def preStart() = { arbiter !Join }
+  // acdhirr: send request to join
+  override def preStart() = { arbiter ! Join }
 
   // Persistence actor
   val persistence: ActorRef = context.actorOf(persistenceProps,s"persistence-${rnd}")
   context.watch(persistence)
   override val supervisorStrategy = OneForOneStrategy() {
-    case e: PersistenceException => Restart
+    case e: PersistenceException => {
+      println("RESTARTING...")
+      Restart
+    }
   }
 
   context.setReceiveTimeout(1000.milliseconds)
@@ -109,6 +112,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       updates(id).sender ! OperationFailed(id)
 
     case IsPersisted(key,id) =>
+      println("Persisted: " + (key,id) + " " + updates + " leader: " + self)
       updates(id).isPersisted = true
       if (updates(id).isComplete) handleComplete(id)
 
@@ -117,12 +121,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       if (updates(id).isComplete) handleComplete(id)
 
     case Insert(key, value, id) =>
+      println("Inserted: " + (key,value,id) + " " + updates)
       kv += (key->value)
       updates += id->UpdateStatus(sender,false,false)
       disseminate(key,Some(value),id)
       persist(key,Some(value),id)
 
     case Remove(key, id) =>
+      println("Removed: " + (key,id) + " " + updates)
       kv -= key
       updates += id->UpdateStatus(sender,false,false)
       disseminate(key,None,id)
@@ -200,7 +206,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   }
 
   /* Behavior when persisting. */
-  def persisting(id:Long): Receive = leader orElse {
+  def persisting(id:Long): Receive = {
 
     // Replica should already serve the received update while waiting for persistence!
     case Get(key, id) =>

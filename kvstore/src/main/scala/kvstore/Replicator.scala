@@ -36,7 +36,7 @@ class Replicator(val replica: ActorRef) extends Actor {
     seqCounter
   }
 
-  /* Behavior for the Replicator. */
+  /* TODO Behavior for the Replicator. */
   // The role of this Replicator actor is to accept update events, and propagate the changes
   // to its corresponding replica (i.e. there is exactly one Replicator per secondary replica).
   def receive: Receive = {
