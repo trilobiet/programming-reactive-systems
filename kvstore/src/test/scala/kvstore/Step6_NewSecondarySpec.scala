@@ -68,6 +68,8 @@ trait Step6_NewSecondarySpec { this: KVStoreSuite =>
     secondary.reply(SnapshotAck("k1", 0L))
     user.waitAck(ack1)
 
+    println("\n\n------------------\n\nSecondary ref = " + secondary.ref)
+
     val ack2 = user.set("k1", "v2")
     secondary.expectMsg(Snapshot("k1", Some("v2"), 1L))
     arbiter.send(primary, Replicas(Set(primary)))
