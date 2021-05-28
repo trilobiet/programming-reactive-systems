@@ -25,8 +25,8 @@ class Disseminator(replicateMsg:Replicate, replicators: Set[ActorRef]) extends A
 
   context.setReceiveTimeout(1000.milliseconds)
 
-  /* Mutable set containing replicators that await replication
-  Once this set is empty, we're done and can reply to the disseminators parent */
+  /* Mutable set containing replicators that await replication.
+  Once this set is empty, we're done and can reply to the disseminators parent. */
   var reps = scala.collection.mutable.Set[ActorRef]() ++= replicators
 
   private def replyReady() = {
@@ -44,7 +44,7 @@ class Disseminator(replicateMsg:Replicate, replicators: Set[ActorRef]) extends A
       reps -= sender() // replicator done
       if (reps.isEmpty) replyReady()
 
-    /* Tells the disseminator that a Replicator is no longer taking part.
+    /* Tells the disseminator that a Replicator is no longer taking part
        so it can be removed from the replicators set.
     */
     case ReplicaRemoved(replicator) =>

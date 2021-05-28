@@ -58,7 +58,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
   // Disseminate an update to a set of replicators
   private def disseminate(key: String, valueOption: Option[String], id: Long, replicators:Set[ActorRef]) = {
-    val disseminator: ActorRef = context.actorOf(Props(new Disseminator(Replicate(key,valueOption,id),secondaries.values.toSet)),s"disseminator-${rnd}")
+    val disseminator: ActorRef = context.actorOf(
+      Props(new Disseminator(Replicate(key,valueOption,id),secondaries.values.toSet)),s"disseminator-${rnd}")
     disseminator ! Disseminate
   }
 
@@ -67,31 +68,25 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     context.become( persisting(id), discardOld = false ) // discard=false, so we can use 'unbecome'
     self ! Persist(key,valueOption,id)
   }
-
-  // Tell a client that update is OK (primary/leader only)
-  private def handleComplete(id: Long) = {
-    updates(id).sender ! OperationAck(id)
-  }
   // -------------------------------------------------------------
-
-  // Send request to join
-  override def preStart() = { arbiter ! Join }
-
-  // Persistence actor for this replica
-  val persistence: ActorRef = context.actorOf(persistenceProps,s"persistence-${rnd}")
-  context.watch(persistence)
-  override val supervisorStrategy = OneForOneStrategy() {
-    case e: PersistenceException =>  Restart
-  }
 
   context.setReceiveTimeout(1000.milliseconds)
 
   // When your actor starts, it must send a Join message to the Arbiter and then choose
   // between primary or secondary behavior according to the reply of the Arbiter to the
   // Join message (a JoinedPrimary or JoinedSecondary message).
+  override def preStart() = { arbiter ! Join }
+
   def receive = {
     case JoinedPrimary   => context.become(leader)
     case JoinedSecondary => context.become(replica)
+  }
+
+  // Persistence actor for this replica
+  val persistence: ActorRef = context.actorOf(persistenceProps,s"persistence-${rnd}")
+  context.watch(persistence)
+  override val supervisorStrategy = OneForOneStrategy() {
+    case e: PersistenceException =>  Restart
   }
 
   /* Behavior for the leader (PRIMARY) role. */
@@ -111,14 +106,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
     case IsPersisted(key,id) =>
       updates(id).isPersisted = true
-      if (updates(id).isComplete) handleComplete(id)
+      if (updates(id).isComplete) updates(id).sender ! OperationAck(id)
 
     case IsNotPersisted(id) =>
       updates(id).sender ! OperationFailed(id)
 
     case IsDisseminated(id) =>
       updates(id).isDisseminated = true
-      if (updates(id).isComplete) handleComplete(id)
+      if (updates(id).isComplete) updates(id).sender ! OperationAck(id)
 
     case Insert(key, value, id) =>
       kv += (key->value)
