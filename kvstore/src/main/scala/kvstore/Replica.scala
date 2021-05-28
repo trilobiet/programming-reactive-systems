@@ -1,12 +1,11 @@
 package kvstore
 
-import akka.actor.SupervisorStrategy.{Restart, Stop}
-import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, PoisonPill, Props, ReceiveTimeout, Stash, SupervisorStrategy, Terminated}
+import akka.actor.SupervisorStrategy.Restart
+import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, Props, ReceiveTimeout, Stash}
 import kvstore.Arbiter._
-import akka.pattern.{ask, pipe}
+import kvstore.Disseminator.{Disseminate, DisseminationTimeout, IsDisseminated, ReplicaRemoved}
 
 import scala.concurrent.duration._
-import kvstore.Disseminator.{IsDisseminated, Disseminate, DisseminationTimeout, ReplicaRemoved}
 import scala.util.Random
 
 object Replica {
@@ -19,6 +18,7 @@ object Replica {
   case class Get(key: String, id: Long) extends Operation
 
   case class IsPersisted(key: String, id: Long)
+  case class IsNotPersisted(id: Long)
 
   sealed trait OperationReply
   case class OperationAck(id: Long) extends OperationReply
@@ -31,59 +31,57 @@ object Replica {
 }
 
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with Stash {
+  import Persistence._
   import Replica._
   import Replicator._
-  import Persistence._
   import context.dispatcher
 
-  /*
-   * The contents of this actor is just a suggestion, you can implement it in any way you like.
-   */
-
-  case class UpdateStatus(sender: ActorRef, var isPersisted: Boolean, var isDisseminated: Boolean) {
-    def isComplete = isPersisted && isDisseminated
-  }
   // Maps id -> updateStatus
   var updates = Map.empty[Long,UpdateStatus]
 
-  // the data: key-value pairs
+  // The data: key-value pairs
   var kv = Map.empty[String, String]
-  // a map from secondary replicas to replicators
+
+  // A map from secondary replicas to replicators
   var secondaries = Map.empty[ActorRef, ActorRef]
-  // the current set of replicators
-  // var replicators = Set.empty[ActorRef]
-  // secondary nodes expect this seq number for updates
+
+  // Secondary nodes expect this seq number for updates
   var nextSeq = 0L
   var persistTask: Option[Cancellable] = None
 
+  // Status objects containing progress status of a request to the primary (leader) replica
+  case class UpdateStatus(sender: ActorRef, var isPersisted: Boolean, var isDisseminated: Boolean) {
+    def isComplete = isPersisted && isDisseminated
+  }
+
   // COMMON METHODS ----------------------------------------------
-  private def disseminate(key: String, valueOption: Option[String], id: Long) = {
+
+  // Disseminate an update to a set of replicators
+  private def disseminate(key: String, valueOption: Option[String], id: Long, replicators:Set[ActorRef]) = {
     val disseminator: ActorRef = context.actorOf(Props(new Disseminator(Replicate(key,valueOption,id),secondaries.values.toSet)),s"disseminator-${rnd}")
     disseminator ! Disseminate
   }
 
+  // Persist an update
   private def persist(key: String, valueOption: Option[String], id: Long) = {
     context.become( persisting(id), discardOld = false ) // discard=false, so we can use 'unbecome'
     self ! Persist(key,valueOption,id)
   }
 
+  // Tell a client that update is OK (primary/leader only)
   private def handleComplete(id: Long) = {
     updates(id).sender ! OperationAck(id)
-    nextSeq += 1 // increase counter
   }
   // -------------------------------------------------------------
 
-  // acdhirr: send request to join
+  // Send request to join
   override def preStart() = { arbiter ! Join }
 
-  // Persistence actor
+  // Persistence actor for this replica
   val persistence: ActorRef = context.actorOf(persistenceProps,s"persistence-${rnd}")
   context.watch(persistence)
   override val supervisorStrategy = OneForOneStrategy() {
-    case e: PersistenceException => {
-      println("RESTARTING...")
-      Restart
-    }
+    case e: PersistenceException =>  Restart
   }
 
   context.setReceiveTimeout(1000.milliseconds)
@@ -112,27 +110,27 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       updates(id).sender ! OperationFailed(id)
 
     case IsPersisted(key,id) =>
-      println("Persisted: " + (key,id) + " " + updates + " leader: " + self)
       updates(id).isPersisted = true
       if (updates(id).isComplete) handleComplete(id)
+
+    case IsNotPersisted(id) =>
+      updates(id).sender ! OperationFailed(id)
 
     case IsDisseminated(id) =>
       updates(id).isDisseminated = true
       if (updates(id).isComplete) handleComplete(id)
 
     case Insert(key, value, id) =>
-      println("Inserted: " + (key,value,id) + " " + updates)
       kv += (key->value)
-      updates += id->UpdateStatus(sender,false,false)
-      disseminate(key,Some(value),id)
-      persist(key,Some(value),id)
+      updates += id->UpdateStatus(sender(),false,false)
+      disseminate( key, Some(value), id, replicators=secondaries.values.toSet )
+      persist( key, Some(value), id )
 
     case Remove(key, id) =>
-      println("Removed: " + (key,id) + " " + updates)
       kv -= key
-      updates += id->UpdateStatus(sender,false,false)
-      disseminate(key,None,id)
-      persist(key,None,id)
+      updates += id->UpdateStatus(sender(),false,false)
+      disseminate( key, None, id, replicators=secondaries.values.toSet )
+      persist( key, None, id )
 
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id) // kv get returns Option
@@ -148,14 +146,15 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     */
     case Replicas(replicas) =>
 
-      val secReplicas = replicas.filterNot(_.actorRef==self)
+      val secReplicas = replicas.filterNot(_ == self) // leave out the primary
       val newReplicas: Set[ActorRef] = secReplicas.diff(secondaries.keys.toSet)
       val removedReplicas: Set[ActorRef] = secondaries.keys.toSet.diff(secReplicas)
 
       // remove and stop removed replicas
       removedReplicas.foreach(r => {
           context.stop(secondaries(r)) // associated Replicator
-          context.stop(r) // Todo make dependent (watch?)
+          context.stop(r)
+          // tell disseminators that Replicator is gone
           context.children.foreach(_ ! ReplicaRemoved(secondaries(r)))
           secondaries -= r
         })
@@ -165,9 +164,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       val newSecondaries: Map[ActorRef, ActorRef] = secondaries.view.filterKeys(newReplicas).toMap
 
       kv.zipWithIndex.foreach { case((k,v),i) => {
-        updates += i.toLong->UpdateStatus(sender,true,false) // already persisted!
-        val disseminator: ActorRef = context.actorOf(Props(new Disseminator(Replicate(k, Some(v), i), newSecondaries.values.toSet)),s"disseminator-${rnd}")
-        disseminator ! Disseminate
+        updates += i.toLong->UpdateStatus(sender(),true,false) // already persisted!
+        disseminate( k, Some(v), i, replicators=newSecondaries.values.toSet )
       }}
   }
 
@@ -183,25 +181,28 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       sender() ! GetResult(key, kv.get(key), id) // kv get returns Option
 
     // Do not process messages with a sequence number smaller
-    // than the expected number, but do immediately acknowledge them
+    // than the expected number, but do immediately acknowledge them.
     case Snapshot(key, _, seq) if seq < nextSeq =>
       sender() ! SnapshotAck(key, seq)
 
-    // Update and persist when expected seq number arrives
+    // Update and persist when expected seq number arrives.
     case Snapshot(key, valueOption, seq) if seq == nextSeq =>
 
-      secondaries += self->sender // map replicator to this replica
+      secondaries += self->sender() // map replicator to this replica
 
       valueOption match {
         case None => kv -= key
         case Some(value) => kv += (key->value)
       }
 
+      nextSeq += 1 // increase sequence counter
       persist(key,valueOption,seq)
 
     case IsPersisted(key,id) =>
       secondaries(self) ! SnapshotAck(key, id) // forward to replicator
-      nextSeq += 1 // increase counter
+
+    case IsNotPersisted(id) =>
+      secondaries(self) ! OperationFailed(id)
 
   }
 
@@ -217,24 +218,21 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
         Duration.Zero,100.milliseconds,persistence,message
       ))
 
-    // Persistence time out
+    // Persistence time out (does this ever happen?)
     case ReceiveTimeout =>
-      println("Persistence timeout!!!!!!")
-      updates(id).sender ! OperationFailed(id)
+      persistTask.map(_.cancel()) // stop repeating messages
+      context.unbecome()  // revert to previous behaviour
+      self ! IsNotPersisted(id)
 
     // Persistence succeeded
     case Persisted(key,id) =>
-      self ! IsPersisted(key, id) // forward to replicator
       persistTask.map(_.cancel()) // stop repeating messages
       context.unbecome()  // revert to previous behaviour
+      self ! IsPersisted(key, id) // forward to replicator
       unstashAll()
 
     case _ => stash()
 
-  }
-
-  override def postStop(): Unit = {
-    println("REPLICA STOPPING " + self)
   }
 
 }
